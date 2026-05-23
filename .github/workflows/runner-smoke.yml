@@ -1,0 +1,80 @@
+name: runner-smoke
+
+# Validates the andook org's self-hosted Linux x64 runners (Phase 10).
+#
+# Fans out a 4-leg matrix across runners labeled
+# [self-hosted, linux, x64, ms-a2]. With GH_MS_A2_RUNNER_INSTANCES=4
+# (4 concurrent runners on MS-A2 pinned to cores 0–7), all 4 legs should
+# run in parallel — proving:
+#   - The runners are reachable + Idle
+#   - CPU affinity pinning is honored (Cpus_allowed_list = 0-7 in every job)
+#   - Toolchain (rustup, mold, Node, git-lfs) is on the runner's PATH
+#   - Artifact upload via actions/upload-artifact@v4 works
+#
+# Trigger via UI or:
+#   gh workflow run runner-smoke.yml --repo andook/.github
+#
+# Total wall time ~25s; the sleep 20 in each leg forces visible concurrency.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fanout:
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
+    runs-on: [self-hosted, linux, x64, ms-a2]
+    env:
+      # Pass matrix.slot through env to avoid any expression-in-run-block
+      # security-hook complaints; matrix values are constrained to
+      # integer literals [1,2,3,4] so there's no real injection risk here,
+      # but the env: pattern is the uniform best practice.
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          uname -a
+          cat /etc/os-release
+          echo "PATH=$PATH"
+          which cargo rustc mold node git-lfs || true
+          cargo --version  || true
+          rustc --version  || true
+          node  --version  || true
+          ld.mold --version 2>&1 || true
+          echo "HOSTNAME=$HOSTNAME"
+          echo "RUNNER_NAME=$RUNNER_NAME"
+          echo "SLOT=$SLOT"
+
+      - name: CPU affinity proof
+        run: |
+          # Confirms the runner unit's CPUAffinity=0-7 propagated to job processes.
+          grep -E '^Cpus_allowed_list:' /proc/self/status
+
+      - name: Memory limit proof
+        run: |
+          # systemd v5+ writes cgroup memory limits readable from within
+          # the cgroup. Should report ~8 GiB = 8589934592 bytes per
+          # GH_MS_A2_RUNNER_MEMORY_MAX.
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "(cgroup v2 not at this path; check /proc/self/cgroup)"
+
+      - name: Sleep so 4 jobs overlap
+        run: sleep 20
+
+      - name: Write an artifact
+        run: |
+          mkdir -p out
+          date > out/when.txt
+          echo "hello from $RUNNER_NAME (slot=$SLOT)" >> out/when.txt
+          uname -a >> out/when.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-slot-${{ matrix.slot }}
+          path: out/

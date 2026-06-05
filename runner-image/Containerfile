@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# ghcr.io/andook/arm64-runner — Actions Runner Controller (ARC) image for the
+# andook Rust monorepo CI on the MS-R1 arm64 k3s host.
+# See network-migration/docs/15-ms-r1-arc-arm64-runners.md §6.
+#
+# The apt/installer tool layer is derived from runner-tools/managed-tools.conf
+# (the SINGLE EDIT POINT, shared with the bare-metal MS-A2/Pi runners) via the
+# same runner-tools-update.sh — so the image never drifts from the hosts.
+# Toolchains (rustup/clippy/target, cargo-lambda, Node) are baked here on
+# purpose: ARC pods are ephemeral, so a per-job reinstall would be wasteful
+# (unlike the persistent bare-metal hosts, where they're workflow-managed).
+
+ARG ARC_RUNNER_VERSION=latest
+FROM ghcr.io/actions/actions-runner:${ARC_RUNNER_VERSION}
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# --- managed host tool set (single source of truth) --------------------------
+# Installs the whole managed set: gh, build-essential, mold, clang, lld,
+# pkg-config, libssl-dev, protobuf-compiler, cmake, awscli, git-lfs, jq, … .
+COPY runner-tools/managed-tools.conf      /etc/github-runner-tools.conf
+COPY runner-tools/runner-tools-update.sh  /usr/local/sbin/runner-tools-update.sh
+RUN chmod 0755 /usr/local/sbin/runner-tools-update.sh \
+ && DEBIAN_FRONTEND=noninteractive apt-get update \
+ && DEBIAN_FRONTEND=noninteractive /usr/local/sbin/runner-tools-update.sh --no-guard \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Rust toolchain (image-wide; world-rwx so the `runner` user can use it) ---
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal \
+          --default-toolchain stable \
+          --component clippy rustfmt \
+          --target aarch64-unknown-linux-gnu \
+ && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME" \
+ && rustc --version && cargo clippy --version
+
+# mold comes from the manifest (apt). Wire it as the arm64 target linker (the
+# bare-metal hosts set the same env per-runner).
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+
+# --- cargo-lambda (pinned; bump as the monorepo requires) --------------------
+# VERIFY on first build: confirm this release-asset name/path for the pinned tag
+# (cargo-lambda publishes musl tarballs per target). pip install is the fallback.
+ARG CARGO_LAMBDA_VERSION=1.9.1
+RUN curl -fsSL "https://github.com/cargo-lambda/cargo-lambda/releases/download/v${CARGO_LAMBDA_VERSION}/cargo-lambda-v${CARGO_LAMBDA_VERSION}.aarch64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/cargo/bin \
+ && cargo-lambda --version
+
+# --- Node LTS (for JS-based actions: actions/checkout@v4, upload-artifact@v4) -
+ARG NODE_MAJOR=24
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && node --version
+
+USER runner

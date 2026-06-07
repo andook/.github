@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         slot: [1, 2, 3, 4]
-    runs-on: [self-hosted, linux, x64, ms-a2]
+    runs-on: x86-64-linux
     env:
       # Pass matrix.slot through env to avoid any expression-in-run-block
       # security-hook complaints; matrix values are constrained to
